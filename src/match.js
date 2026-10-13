@@ -202,7 +202,7 @@ export class Match extends DurableObject {
         if (mz && e && !mz.includes(null) && !e.includes(null)) this.broadcast({ t: 'shot', by: s.id, gun: s.gun, m: mz, e }, f);
         if (g.pellets) {
           let left = g.pellets;
-          for (const c of (Array.isArray(m.pel) ? m.pel.slice(0, 3) : [])) {
+          for (const c of (Array.isArray(m.pel) ? m.pel.slice(0, 6) : [])) {
             const hit = c && this.f.get(c.id), n = Math.min(left, Math.max(0, c.n | 0)), hd = Math.min(n, Math.max(0, c.hd | 0)); left -= n;
             if (!hit || hit === s || !n) continue;
             const d = this.dist(s, hit); if (d > g.rng + 4 || this.bubbleBetween(s, s.y + 1.1, hit, hit.y + 0.9)) continue;

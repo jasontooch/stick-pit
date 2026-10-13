@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import * as BJ from './blackjack.js';
+import * as BT from './bjtable.js';
 import { START_BUCKS, SHOP, SLOTS, checkUsername } from './rules.js';
 export { Match } from './match.js';
 
@@ -28,7 +29,7 @@ async function pbkdf2(pass, salt) {   // passwords are only ever stored as a sal
   return toHex(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode(salt), iterations: 100000 }, key, 256));
 }
 function same(a, b) { if (a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i); return d === 0; }
-const MAX_PARTY = 6;
+const MAX_PARTY = 6, OFFLINE_GRACE_MS = 45000;
 
 /* The lobby: one global object that owns accounts and logins, Stick Bucks, the shop, the leaderboard,
    who's online, friends, parties, matchmaking and blackjack. Lobby sockets hibernate between messages. */
@@ -47,6 +48,27 @@ export class Lobby extends DurableObject {
     sql.exec('CREATE TABLE IF NOT EXISTS invites(from_uid TEXT, to_uid TEXT, party TEXT, at INTEGER, PRIMARY KEY(from_uid,to_uid))');
     sql.exec('CREATE TABLE IF NOT EXISTS matches(id TEXT PRIMARY KEY, humans INTEGER, ends_at INTEGER, updated INTEGER)');
     sql.exec('CREATE TABLE IF NOT EXISTS ratelimit(k TEXT PRIMARY KEY, n INTEGER, t INTEGER)');
+    sql.exec('CREATE TABLE IF NOT EXISTS timers(k TEXT PRIMARY KEY, at INTEGER)');
+    sql.exec('CREATE TABLE IF NOT EXISTS bjtables(id TEXT PRIMARY KEY, s TEXT, updated INTEGER)');
+    sql.exec('CREATE TABLE IF NOT EXISTS bjseats(uid TEXT PRIMARY KEY, tid TEXT)');
+    sql.exec('CREATE TABLE IF NOT EXISTS recent(a TEXT, b TEXT, at INTEGER, PRIMARY KEY(a,b))');
+    try { sql.exec("ALTER TABLE parties ADD COLUMN playlist TEXT DEFAULT 'ffa'"); } catch {}
+  }
+  // ---------- timers: one DO alarm drives the board push, blackjack clocks and offline checks ----------
+  setTimer(k, at) { this.sql.exec('INSERT OR REPLACE INTO timers(k,at) VALUES(?,?)', k, at); this.armAlarm(); }
+  clearTimer(k) { this.sql.exec('DELETE FROM timers WHERE k=?', k); }
+  armAlarm() { const r = this.one('SELECT MIN(at) AS at FROM timers'); if (r && r.at) this.ctx.storage.setAlarm(Math.max(Date.now() + 20, r.at)); }
+  async alarm() {
+    const now = Date.now(), due = this.all('SELECT k FROM timers WHERE at<=?', now + 15);
+    for (const { k } of due) {
+      this.clearTimer(k);
+      try {
+        if (k === 'board') { this.lastBoard = now; this.pushBoard(); }
+        else if (k.startsWith('bj:')) this.bjTick(k.slice(3));
+        else if (k.startsWith('off:')) this.offlineCheck(k.slice(4));
+      } catch (e) { console.log('timer', k, e && e.message); }
+    }
+    this.armAlarm();
   }
   // ---------- small helpers ----------
   one(q, ...a) { const r = [...this.sql.exec(q, ...a)]; return r[0] || null; }
@@ -86,8 +108,7 @@ export class Lobby extends DurableObject {
       try { w.send(JSON.stringify({ t: 'online', n: on.length, list: on.filter(x => x.uid !== a.uid).map(x => ({ ...x, friend: fr.has(x.uid) })) })); } catch {} }
   }
   pushBoard() { const s = JSON.stringify({ t: 'board', top: this.top() }); for (const w of this.socks()) { try { w.send(s); } catch {} } }
-  boardSoon() { const now = Date.now(); if (now - (this.lastBoard || 0) > 1500) { this.lastBoard = now; this.pushBoard(); } else this.ctx.storage.setAlarm(now + 1600); }
-  async alarm() { this.lastBoard = Date.now(); this.pushBoard(); }
+  boardSoon() { const now = Date.now(); if (now - (this.lastBoard || 0) > 1500) { this.lastBoard = now; this.pushBoard(); } else this.setTimer('board', now + 1600); }
   pushMe(uid) { const a = this.acct(uid); if (a) this.sendTo(uid, { t: 'me', me: this.me(a) }); }
 
   // ---------- friends ----------
@@ -100,6 +121,8 @@ export class Lobby extends DurableObject {
       if (r.state === 'accepted') out.friends.push(o); else if (r.b === uid) out.requests.push(o); else out.sent.push(o);
     }
     out.friends.sort((x, y) => (y.online - x.online) || x.name.localeCompare(y.name));
+    out.recent = this.all('SELECT r.b, r.at, a.name, a.loadout FROM recent r JOIN accounts a ON a.uid=r.b WHERE r.a=? ORDER BY r.at DESC LIMIT 8', uid)
+      .map(r => ({ uid: r.b, name: r.name, loadout: this.parse(r.loadout, {}), at: r.at, online: on.has(r.b), status: on.has(r.b) ? on.get(r.b).status : 'offline' }));
     return out;
   }
   pushFriends(uid) { this.sendTo(uid, { t: 'friends', ...this.friendsOf(uid) }); }
@@ -111,16 +134,81 @@ export class Lobby extends DurableObject {
     const on = this.onlineMap();
     const members = this.all('SELECT m.uid, a.name, a.loadout FROM party_members m JOIN accounts a ON a.uid=m.uid WHERE m.party=? ORDER BY m.joined', pid)
       .map(r => ({ uid: r.uid, name: r.name, loadout: this.parse(r.loadout, {}), online: on.has(r.uid), status: on.has(r.uid) ? on.get(r.uid).status : 'offline' }));
-    return { id: pid, leader: p.leader, members, max: MAX_PARTY };
+    return { id: pid, leader: p.leader, members, max: MAX_PARTY, playlist: p.playlist === 'bj' ? 'bj' : 'ffa' };
   }
   pushParty(pid) { const v = this.partyView(pid); if (!v) return; for (const m of v.members) this.sendTo(m.uid, { t: 'party', party: v }); }
   leaveParty(uid) {
     const pid = this.partyOf(uid); if (!pid) return;
+    const now = Date.now();
+    for (const r of this.all('SELECT uid FROM party_members WHERE party=? AND uid<>?', pid, uid)) {   // remember who you played with
+      this.sql.exec('INSERT OR REPLACE INTO recent(a,b,at) VALUES(?,?,?)', r.uid, uid, now); this.sql.exec('INSERT OR REPLACE INTO recent(a,b,at) VALUES(?,?,?)', uid, r.uid, now);
+      this.pushFriends(r.uid); }
     this.sql.exec('DELETE FROM party_members WHERE uid=?', uid);
     const rest = this.all('SELECT uid FROM party_members WHERE party=? ORDER BY joined', pid);
     if (rest.length <= 1) { for (const r of rest) { this.sql.exec('DELETE FROM party_members WHERE uid=?', r.uid); this.sendTo(r.uid, { t: 'party', party: null }); } this.sql.exec('DELETE FROM parties WHERE id=?', pid); }
     else { const p = this.one('SELECT leader FROM parties WHERE id=?', pid); if (p && p.leader === uid) this.sql.exec('UPDATE parties SET leader=? WHERE id=?', rest[0].uid, pid); this.pushParty(pid); }
-    this.sendTo(uid, { t: 'party', party: null });
+    this.sendTo(uid, { t: 'party', party: null }); this.pushFriends(uid);
+  }
+  offlineCheck(uid) {   // a party member who stayed offline through the grace period is dropped from the party
+    if (this.socksOf(uid).length) return;
+    const pid = this.partyOf(uid); if (!pid) return;
+    const name = (this.acct(uid) || {}).name || 'Someone';
+    const others = this.all('SELECT uid FROM party_members WHERE party=? AND uid<>?', pid, uid).map(r => r.uid);
+    this.leaveParty(uid);
+    for (const o of others) this.sendTo(o, { t: 'toast', msg: `${name} went offline and left the party` });
+  }
+
+  // ---------- group blackjack ----------
+  bjLoad(tid) { const r = this.one('SELECT s FROM bjtables WHERE id=?', tid); return r ? this.parse(r.s, null) : null; }
+  bjMoney(touched) {
+    return {
+      take: (uid, n) => { const a = this.one('SELECT bucks FROM accounts WHERE uid=?', uid); if (!a || a.bucks < n) return false;
+        this.sql.exec('UPDATE accounts SET bucks=bucks-?, updated=? WHERE uid=?', n, Date.now(), uid); touched.add(uid); return true; },
+      give: (uid, n) => { if (!n) return; this.sql.exec('UPDATE accounts SET bucks=bucks+?, updated=? WHERE uid=?', n, Date.now(), uid); touched.add(uid); },
+    };
+  }
+  bjSave(t, touched) {
+    const now = Date.now();
+    if (t.empty && !t.seats.some(s => !s.bot && !s.gone)) { this.sql.exec('DELETE FROM bjtables WHERE id=?', t.id); this.clearTimer('bj:' + t.id); }
+    else {
+      t.empty = false;
+      this.sql.exec('INSERT OR REPLACE INTO bjtables(id,s,updated) VALUES(?,?,?)', t.id, JSON.stringify(t), now);
+      if (t.deadline) this.setTimer('bj:' + t.id, t.deadline); else this.clearTimer('bj:' + t.id);
+      const v = JSON.stringify({ t: 'bjt', table: BT.view(t, now) });
+      for (const s of t.seats) if (!s.bot && !s.gone) for (const w of this.socksOf(s.uid)) { try { w.send(v); } catch {} }
+    }
+    for (const u of touched || []) this.pushMe(u);
+    if (touched && touched.size) this.boardSoon();
+  }
+  bjTick(tid) {
+    const t = this.bjLoad(tid); if (!t) return;
+    const touched = new Set(), M = this.bjMoney(touched), now = Date.now();
+    let n = 0; while (n++ < 4 && BT.tick(t, now, M.take, M.give)) { if (t.deadline > now) break; }
+    this.bjSave(t, touched);
+  }
+  bjLeave(uid) {
+    const r = this.one('SELECT tid FROM bjseats WHERE uid=?', uid); if (!r) return;
+    this.sql.exec('DELETE FROM bjseats WHERE uid=?', uid);
+    const t = this.bjLoad(r.tid); if (!t) return;
+    const touched = new Set(), M = this.bjMoney(touched);
+    BT.leave(t, uid, Date.now(), M.give); this.bjSave(t, touched);
+  }
+  bjJoin(uid) {
+    const a = this.acct(uid); if (!a) return;
+    const pid = this.partyOf(uid), tid = pid ? 'p:' + pid : 'u:' + uid;
+    const cur = this.one('SELECT tid FROM bjseats WHERE uid=?', uid);
+    if (cur && cur.tid !== tid) this.bjLeave(uid);
+    const t = this.bjLoad(tid) || BT.create(tid);
+    const e = BT.join(t, { uid, name: a.name, loadout: this.parse(a.loadout, {}) });
+    if (e) { this.sendTo(uid, { t: 'toast', msg: e }); return; }
+    this.sql.exec('INSERT OR REPLACE INTO bjseats(uid,tid) VALUES(?,?)', uid, tid);
+    this.bjSave(t, new Set());
+  }
+  bjDo(uid, fn) {
+    const r = this.one('SELECT tid FROM bjseats WHERE uid=?', uid); if (!r) return 'Sit down at the table first';
+    const t = this.bjLoad(r.tid); if (!t) return 'The table closed';
+    const touched = new Set(), M = this.bjMoney(touched);
+    const e = fn(t, M); this.bjSave(t, touched); return e;
   }
 
   // ---------- HTTP ----------
@@ -263,12 +351,16 @@ export class Lobby extends DurableObject {
         if (this.partyOf(uid) !== inv.party) { this.leaveParty(uid); this.sql.exec('INSERT OR REPLACE INTO party_members(uid,party,joined) VALUES(?,?,?)', uid, inv.party, now); }
         this.pushParty(inv.party);
         break; }
-      case 'bjv': {   // your blackjack hand, mirrored to party members sitting at the same table
-        const pid = this.partyOf(uid); if (!pid) break;
-        const ok = /^(10|[2-9AJQK])[\u2660\u2665\u2666\u2663]$/;
-        const p = (Array.isArray(m.p) ? m.p.slice(0, 11) : []).filter(c => typeof c === 'string' && ok.test(c));
-        const res = ['win', 'lose', 'push', 'bj'].includes(m.res) ? m.res : null, bet = Math.max(0, Math.min(1e9, Math.floor(+m.bet || 0)));
-        for (const r of this.all('SELECT uid FROM party_members WHERE party=?', pid)) if (r.uid !== uid) this.sendTo(r.uid, { t: 'bjv', uid, p, res, bet });
+      case 'bjJoin': this.bjJoin(uid); break;
+      case 'bjLeave': this.bjLeave(uid); break;
+      case 'bjBet': { const e = this.bjDo(uid, (t, M) => BT.bet(t, uid, m.bet, Date.now(), M.take, M.give)); if (e) err(e); break; }
+      case 'bjAct': { const a = ['hit', 'stand', 'double'].includes(m.a) ? m.a : null; if (!a) break;
+        const e = this.bjDo(uid, (t, M) => BT.act(t, uid, a, Date.now(), M.take, M.give)); if (e) err(e); break; }
+      case 'playlist': { const pid = this.partyOf(uid), p = pid && this.one('SELECT leader FROM parties WHERE id=?', pid);
+        if (!p || p.leader !== uid) break; this.sql.exec('UPDATE parties SET playlist=? WHERE id=?', m.p === 'bj' ? 'bj' : 'ffa', pid); this.pushParty(pid); break; }
+      case 'goBj': { const pid = this.partyOf(uid), p = pid && this.one('SELECT leader FROM parties WHERE id=?', pid);
+        if (!p || p.leader !== uid) break;
+        for (const r of this.all('SELECT uid FROM party_members WHERE party=?', pid)) if (r.uid !== uid && this.socksOf(r.uid).some(w => this.att(w).status === 'lobby')) this.sendTo(r.uid, { t: 'goBj' });
         break; }
       case 'leaveParty': this.leaveParty(uid); break;
       case 'kick': { const pid = this.partyOf(uid), p = pid && this.one('SELECT leader FROM parties WHERE id=?', pid), o = String(m.uid || '');
@@ -288,7 +380,15 @@ export class Lobby extends DurableObject {
   }
   async webSocketClose(ws) { const at = this.att(ws); try { ws.close(); } catch {} this.afterLeave(at.uid); }
   async webSocketError(ws) { const at = this.att(ws); this.afterLeave(at.uid); }
-  afterLeave(uid) { this.pushOnline(); if (!uid) return; for (const f of this.friendSet(uid)) this.pushFriends(f); const pid = this.partyOf(uid); if (pid) this.pushParty(pid); }
+  afterLeave(uid) {
+    this.pushOnline(); if (!uid) return;
+    for (const f of this.friendSet(uid)) this.pushFriends(f);
+    const pid = this.partyOf(uid); if (pid) this.pushParty(pid);
+    if (!this.socksOf(uid).length) {   // fully offline: leave the blackjack table now, the party after a grace period
+      try { this.bjLeave(uid); } catch {}
+      if (pid) this.setTimer('off:' + uid, Date.now() + OFFLINE_GRACE_MS);
+    }
+  }
 
   // Join the busiest running match with room for the whole group and enough time left; otherwise open a new one.
   async matchmake(accts) {
