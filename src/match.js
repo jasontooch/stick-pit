@@ -191,9 +191,26 @@ export class Match extends DurableObject {
       case 'shot': {
         const s = this.owns(f, m.by); if (!s || !s.alive || s.striking) return;
         const g = GUNS[s.gun]; if (!g || g.melee || now - s.lastShot < g.rate * 1000 * 0.7) return;
+        if (g.mag) {   // two barrels, then a reload once you stop firing
+          if (s.shellGun !== s.gun) { s.shellGun = s.gun; s.shells = g.mag; }
+          if (s.shells < g.mag && now - s.lastShot >= g.reload * 1000 * 0.8) s.shells = g.mag;
+          if (s.shells <= 0) return;
+          s.shells--;
+        }
         s.lastShot = now;
         const mz = Array.isArray(m.m) ? m.m.slice(0, 3).map(v => fin(v, -400, 400)) : null, e = Array.isArray(m.e) ? m.e.slice(0, 3).map(v => fin(v, -400, 400)) : null;
         if (mz && e && !mz.includes(null) && !e.includes(null)) this.broadcast({ t: 'shot', by: s.id, gun: s.gun, m: mz, e }, f);
+        if (g.pellets) {
+          let left = g.pellets;
+          for (const c of (Array.isArray(m.pel) ? m.pel.slice(0, 3) : [])) {
+            const hit = c && this.f.get(c.id), n = Math.min(left, Math.max(0, c.n | 0)), hd = Math.min(n, Math.max(0, c.hd | 0)); left -= n;
+            if (!hit || hit === s || !n) continue;
+            const d = this.dist(s, hit); if (d > g.rng + 4 || this.bubbleBetween(s, s.y + 1.1, hit, hit.y + 0.9)) continue;
+            const fall = d <= 7 ? 1 : Math.max(0.3, 1 - (d - 7) / (g.rng - 7) * 0.7);
+            this.damage(hit, s, Math.round(g.dmg * (n + 0.5 * hd) * fall), g.name, hd * 2 >= n);
+          }
+          break;
+        }
         const claims = g.pierce ? (Array.isArray(m.hits) ? m.hits.slice(0, g.pierce) : []) : (m.hit ? [m.hit] : []);
         for (const c of claims) { const hit = c && this.f.get(c.id);
           if (hit && hit !== s && this.dist(s, hit) <= g.rng + 8 && !this.bubbleBetween(s, s.y + 1.1, hit, hit.y + 0.9)) this.damage(hit, s, Math.round(g.dmg * (c.head ? 1.5 : 1)), g.name, !!c.head); }

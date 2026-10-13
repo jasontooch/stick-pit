@@ -263,6 +263,13 @@ export class Lobby extends DurableObject {
         if (this.partyOf(uid) !== inv.party) { this.leaveParty(uid); this.sql.exec('INSERT OR REPLACE INTO party_members(uid,party,joined) VALUES(?,?,?)', uid, inv.party, now); }
         this.pushParty(inv.party);
         break; }
+      case 'bjv': {   // your blackjack hand, mirrored to party members sitting at the same table
+        const pid = this.partyOf(uid); if (!pid) break;
+        const ok = /^(10|[2-9AJQK])[\u2660\u2665\u2666\u2663]$/;
+        const p = (Array.isArray(m.p) ? m.p.slice(0, 11) : []).filter(c => typeof c === 'string' && ok.test(c));
+        const res = ['win', 'lose', 'push', 'bj'].includes(m.res) ? m.res : null, bet = Math.max(0, Math.min(1e9, Math.floor(+m.bet || 0)));
+        for (const r of this.all('SELECT uid FROM party_members WHERE party=?', pid)) if (r.uid !== uid) this.sendTo(r.uid, { t: 'bjv', uid, p, res, bet });
+        break; }
       case 'leaveParty': this.leaveParty(uid); break;
       case 'kick': { const pid = this.partyOf(uid), p = pid && this.one('SELECT leader FROM parties WHERE id=?', pid), o = String(m.uid || '');
         if (p && p.leader === uid && o !== uid && this.partyOf(o) === pid) { this.leaveParty(o); this.sendTo(o, { t: 'toast', msg: 'You were removed from the party' }); } break; }
