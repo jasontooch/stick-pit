@@ -4,7 +4,7 @@ export const GUNS = {
   ak:     { name: 'AK-47',        dmg: 20, rate: 0.10, rng: 95 },
   sniper: { name: 'Sniper',       dmg: 95, rate: 1.15, rng: 240 },
   flail:  { name: 'Flail',        dmg: 55, rate: 0.80, rng: 0, reach: 3.8, melee: true },
-  gold:   { name: 'Golden Deagle', dmg: 105, rate: 0.72, rng: 170, pierce: 4 },   // one per match; its fat round hits everyone in its path
+  gold:   { name: 'Golden Deagle', dmg: 53, rate: 0.36, rng: 170, pierce: 4 },   // one per match; its fat round hits everyone in its path
 };
 export const STARTER = 'glock';
 export const POOL = [['ak', 4.5], ['flail', 3], ['sniper', 2.2]];
