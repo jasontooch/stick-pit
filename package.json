@@ -1,0 +1,15 @@
+{
+  "name": "stick-pit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Stick Pit: stick-figure shooter with online matchmaking, a global Stick Bucks leaderboard and server-dealt blackjack, on Cloudflare Workers.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "node scripts/build-page.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.150.0"
+  }
+}
