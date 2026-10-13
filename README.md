@@ -16,12 +16,21 @@ A free stick-figure shooter with **online matchmaking**, a **players-online coun
 
 ## How it works
 
-* **Accounts.** Each browser gets an anonymous account automatically (an id and a secret saved in that browser). No sign-up needed.
-* **Players online.** Every open copy of the page keeps a connection to the lobby, and the lobby counts them.
-* **Matchmaking.** Pressing *Play* joins the busiest running match that has room and at least 45 s left. If there isn't one, it opens a new match right away. Bots fill every empty slot (6 fighters per match) and step aside as real players join. If a player leaves, a bot takes their place.
-* **Who decides what.** Each browser runs its own player's movement and aim and reports its shots. The server checks every hit (right weapon, fire rate, range) and applies damage, kills, streaks and payouts. The first person in a room also runs that room's bots.
-* **Stick Bucks.** Kills pay $10. Streaks pay +$25, +$50, +$100 and +$1,000 at 3, 5, 7 and 10 kills. New players start with $100. Blackjack bets and payouts happen on the server.
-* **Offline.** If the page can't reach the server (for example, inside Claude), it falls back to the single-player version with bots.
+* **Accounts.** Players create a unique username and password on their first visit and can log in on any device. Passwords are stored only as salted PBKDF2 hashes, and they can't be recovered.
+* **Saved to the account.** Stick Bucks, lifetime kills, owned items, what you're wearing, friends and parties are all saved.
+* **Friends and parties.**
+  * The Party tab lists everyone online. Invite anyone into a party of up to 6, or send them a friend request.
+  * When the party leader presses Play, the whole party lands in the same match.
+  * Empty party spots show as faint figures in the lobby.
+* **Matchmaking.** Play joins the busiest running match with room for your whole party. Otherwise it opens a new match with bots in the empty slots, and the bots step aside as real players join.
+* **The shop.** The Locker tab turns the lobby into the Stick Shop:
+  * Pumpkin Head and Work Boots are free.
+  * White Tee costs $20, Blue Jeans $50 and Baggy Neon Pants $10,000.
+  * The Dog Tag unlocks at 50 lifetime FFA kills.
+  * The server checks every purchase.
+* **Who decides what.** Each browser runs its own player's movement and aim and reports its shots. The server checks every hit (weapon, fire rate, range, shields) and decides damage, kills, streaks, pickups and payouts.
+* **Stick Bucks.** Kills pay $10. Streaks pay +$25, +$50, +$100 and +$1,000 at 3, 5, 7 and 10 kills. New accounts start with $100.
+* **Offline.** If the page can't reach the server (for example, inside Claude), it runs the single-player version with bots, and the shop saves to that browser.
 
 ---
 
