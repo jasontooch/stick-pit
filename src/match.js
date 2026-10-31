@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import { GUNS, STARTER, pickGun, ITEM_SPOTS, POWER_SPOTS, SPAWNS, BOT_NAMES, MATCH_MS, MAX_FIGHTERS, RESPAWN_MS, SPAWN_INV_MS, PIT_CD_MS,
-  KILL_BUCKS, STREAK_BUCKS, cleanName, rnd, pick, HX, HZ, BUBBLE, DEAGLE_RETURN_MS, SSJ_DMG, SSJ_HEAL, KILL_HEAL } from './rules.js';
+  KILL_BUCKS, STREAK_BUCKS, cleanName, rnd, pick, HX, HZ, BUBBLE, DEAGLE_RETURN_MS, SSJ_DMG, SSJ_HEAL, KILL_HEAL, KILL_GOAL } from './rules.js';
 
 const json = o => new Response(JSON.stringify(o), { headers: { 'content-type': 'application/json' } });
 const fin = (v, lo, hi) => (typeof v === 'number' && isFinite(v) ? Math.max(lo, Math.min(hi, v)) : null);
@@ -97,7 +97,7 @@ export class Match extends DurableObject {
     if (this.phase === 'play' && !empty) {
       this.phase = 'over';
       const st = [...this.f.values()].sort((a, b) => b.kills - a.kills || a.deaths - b.deaths).map(f => ({ id: f.id, name: f.name, k: f.kills, d: f.deaths }));
-      this.broadcast({ t: 'over', st });
+      this.broadcast({ t: 'over', st, goal: KILL_GOAL, winner: this.winner || (st[0] && st[0].id) });
       for (const h of this.humans()) this.send(h, { t: 'summary', earned: h.earned });
       this.closeAt = Date.now() + 15e3;
       this.report(true);
@@ -115,6 +115,12 @@ export class Match extends DurableObject {
   broadcast(o, except) { const s = JSON.stringify(o); for (const f of this.f.values()) if (f.ws && f !== except) { try { f.ws.send(s); } catch {} } }
   owns(f, by) { const t = this.f.get(by); return t && (by === f.id || (this.host === f.id && t.kind === 'b')) ? t : null; }
   dist(a, b) { return Math.hypot(a.x - b.x, a.z - b.z); }
+  deflects(t, s) {   // lightsaber held up (flag 128) and facing the shooter
+    if (t.gun !== 'saber' || !t.s || !((t.s[8] | 0) & 128)) return false;
+    const yaw = t.s[3], dx = s.x - t.x, dz = s.z - t.z, l = Math.hypot(dx, dz) || 1;
+    if ((dx * -Math.sin(yaw) + dz * -Math.cos(yaw)) / l <= Math.cos(1.25)) return false;
+    this.broadcast({ t: 'deflect', id: t.id, by: s.id }); return true;
+  }
   invulnerable(t, now) { return !t.alive || now < t.inv || t.striking; }
 
   spawn(f, silent) {
@@ -168,6 +174,7 @@ export class Match extends DurableObject {
       if (n === 10) { killer.ssj = true; killer.hp = 100; killer.sh = 100; }
       this.broadcast({ t: 'streak', id: killer.id, n, hp: killer.hp, sh: killer.sh });
     }
+    if (killer.kills >= KILL_GOAL && this.phase === 'play') { this.winner = killer.id; setTimeout(() => this.finish(false), 900); }
   }
   explode(x, y, z, owner, r, lo, hi, w, kind) {
     this.broadcast({ t: 'boom', x, y, z, kind, by: owner ? owner.id : null });
@@ -204,7 +211,7 @@ export class Match extends DurableObject {
           let left = g.pellets;
           for (const c of (Array.isArray(m.pel) ? m.pel.slice(0, 6) : [])) {
             const hit = c && this.f.get(c.id), n = Math.min(left, Math.max(0, c.n | 0)), hd = Math.min(n, Math.max(0, c.hd | 0)); left -= n;
-            if (!hit || hit === s || !n) continue;
+            if (!hit || hit === s || !n || this.deflects(hit, s)) continue;
             const d = this.dist(s, hit); if (d > g.rng + 4 || this.bubbleBetween(s, s.y + 1.1, hit, hit.y + 0.9)) continue;
             const fall = d <= 7 ? 1 : Math.max(0.3, 1 - (d - 7) / (g.rng - 7) * 0.7);
             this.damage(hit, s, Math.round(g.dmg * (n + 0.5 * hd) * fall), g.name, hd * 2 >= n);
@@ -213,15 +220,15 @@ export class Match extends DurableObject {
         }
         const claims = g.pierce ? (Array.isArray(m.hits) ? m.hits.slice(0, g.pierce) : []) : (m.hit ? [m.hit] : []);
         for (const c of claims) { const hit = c && this.f.get(c.id);
-          if (hit && hit !== s && this.dist(s, hit) <= g.rng + 8 && !this.bubbleBetween(s, s.y + 1.1, hit, hit.y + 0.9)) this.damage(hit, s, Math.round(g.dmg * (c.head ? 1.5 : 1)), g.name, !!c.head); }
+          if (hit && hit !== s && this.dist(s, hit) <= g.rng + 8 && !this.bubbleBetween(s, s.y + 1.1, hit, hit.y + 0.9) && !this.deflects(hit, s)) this.damage(hit, s, Math.round(g.dmg * (c.head ? 1.5 : 1)), g.name, !!c.head); }
         break; }
       case 'swing': {
-        const s = this.owns(f, m.by); if (!s || !s.alive || s.gun !== 'flail' || now - s.lastSwing < GUNS.flail.rate * 1000 * 0.75) return;
+        const s = this.owns(f, m.by), mg = s && GUNS[s.gun]; if (!s || !s.alive || !mg || !mg.melee || now - s.lastSwing < mg.rate * 1000 * 0.75) return;
         s.lastSwing = now; this.broadcast({ t: 'swing', by: s.id, dir: m.dir === -1 ? -1 : 1 }, f);
         for (const id of (Array.isArray(m.hits) ? m.hits.slice(0, 5) : [])) {
-          const q = this.f.get(id); if (!q || q === s || this.dist(s, q) > GUNS.flail.reach + 2.5 || this.bubbleBetween(s, s.y + 0.8, q, q.y + 0.8)) continue;
+          const q = this.f.get(id); if (!q || q === s || this.dist(s, q) > mg.reach + 2.5 || this.bubbleBetween(s, s.y + 0.8, q, q.y + 0.8)) continue;
           const dx = q.x - s.x || 0.01, dz = q.z - s.z, l = Math.hypot(dx, dz) || 1;
-          this.damage(q, s, GUNS.flail.dmg, 'Flail', false, [dx / l, dz / l]);
+          this.damage(q, s, mg.dmg, mg.name, false, [dx / l, dz / l]);
         }
         break; }
       case 'surge': { const s = this.owns(f, m.by); if (s) this.broadcast({ t: 'surge', by: s.id }, f); break; }
